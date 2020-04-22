@@ -205,7 +205,7 @@ func TestCorsMiddlewareSetsCorrectDefaultHeaders(t *testing.T) {
 		assert.Equal(t, w.Header().Get("Access-Control-Allow-Origin"), "*")
 		assert.Equal(t, w.Header().Get("Access-Control-Allow-Credentials"), "false")
 		assert.Equal(t, w.Header().Get("Access-Control-Max-Age"), "300")
-		assert.Equal(t, w.Header().Get("Access-Control-Allow-Headers"), "Content-Type,Content-Length,Accept-Encoding,X-LaunchDarkly-User-Agent,"+events.EventSchemaHeader)
+		assert.Equal(t, w.Header().Get("Access-Control-Allow-Headers"), "Cache-Control,Content-Type,Content-Length,Accept-Encoding,X-LaunchDarkly-User-Agent,X-LaunchDarkly-Payload-ID,X-LaunchDarkly-Wrapper,"+events.EventSchemaHeader)
 		assert.Equal(t, w.Header().Get("Access-Control-Expose-Headers"), "Date")
 	})).ServeHTTP(resp, req)
 }
@@ -369,6 +369,16 @@ func TestRelay(t *testing.T) {
 		return status
 	}
 
+	assertNonStreamingHeaders := func(t *testing.T, h http.Header) {
+		assert.Equal(t, "", h.Get("X-Accel-Buffering"))
+		assert.NotRegexp(t, "^text/event-stream", h.Get("Content-Type"))
+	}
+
+	assertStreamingHeaders := func(t *testing.T, h http.Header) {
+		assert.Equal(t, "no", h.Get("X-Accel-Buffering"))
+		assert.Regexp(t, "^text/event-stream", h.Get("Content-Type"))
+	}
+
 	t.Run("status", func(t *testing.T) {
 		status := getStatus(relay, t)
 		assert.Equal(t, "sdk-********-****-****-****-*******e42d0", jsonFind(status, "environments", "sdk test", "sdkKey"))
@@ -427,6 +437,7 @@ func TestRelay(t *testing.T) {
 					body, _ := ioutil.ReadAll(result.Body)
 					s.bodyMatcher(t, body)
 				}
+				assertNonStreamingHeaders(t, w.Header())
 			})
 		}
 	})
@@ -471,6 +482,7 @@ func TestRelay(t *testing.T) {
 						assert.JSONEq(t, string(s.expectedData), event.Data())
 					}
 				}
+				assertStreamingHeaders(t, w.Header())
 				w.Close()
 				wg.Wait()
 			})
@@ -520,6 +532,7 @@ func TestRelay(t *testing.T) {
 							s.bodyMatcher(t, body)
 						}
 					}
+					assertNonStreamingHeaders(t, w.Header())
 				})
 
 				t.Run("options", func(t *testing.T) {
@@ -584,6 +597,7 @@ func TestRelay(t *testing.T) {
 					result := w.Result()
 					assert.ElementsMatch(t, []string{s.method, "OPTIONS", "OPTIONS"}, strings.Split(result.Header.Get("Access-Control-Allow-Methods"), ","))
 					assert.Equal(t, "*", result.Header.Get("Access-Control-Allow-Origin"))
+					assertStreamingHeaders(t, w.Header())
 				})
 
 				t.Run("options", func(t *testing.T) {
@@ -611,21 +625,39 @@ func TestRelay(t *testing.T) {
 		}
 	})
 
-	t.Run("server-side events proxy", func(t *testing.T) {
-		w := httptest.NewRecorder()
-		body := makeTestEventBuffer("me")
-		bodyBuffer := bytes.NewBuffer(body)
-		r, _ := http.NewRequest("POST", "http://localhost/bulk", bodyBuffer)
-		r.Header.Set("Content-Type", "application/json")
-		r.Header.Set("Authorization", sdkKey)
-		r.Header.Set(events.EventSchemaHeader, strconv.Itoa(events.SummaryEventsSchemaVersion))
-		relay.ServeHTTP(w, r)
-		result := w.Result()
-		if assert.Equal(t, http.StatusAccepted, result.StatusCode) {
-			event := requirePublishedEvent(body)
-			assert.Equal(t, "/bulk", event.url)
-			assert.Equal(t, sdkKey, event.authKey)
-		}
+	t.Run("server-side events proxies", func(t *testing.T) {
+		t.Run("bulk post", func(t *testing.T) {
+			w := httptest.NewRecorder()
+			body := makeTestEventBuffer("me")
+			bodyBuffer := bytes.NewBuffer(body)
+			r, _ := http.NewRequest("POST", "http://localhost/bulk", bodyBuffer)
+			r.Header.Set("Content-Type", "application/json")
+			r.Header.Set("Authorization", sdkKey)
+			r.Header.Set(events.EventSchemaHeader, strconv.Itoa(events.SummaryEventsSchemaVersion))
+			relay.ServeHTTP(w, r)
+			result := w.Result()
+			if assert.Equal(t, http.StatusAccepted, result.StatusCode) {
+				event := requirePublishedEvent(body)
+				assert.Equal(t, "/bulk", event.url)
+				assert.Equal(t, sdkKey, event.authKey)
+			}
+		})
+
+		t.Run("diagnostics forwarding", func(t *testing.T) {
+			w := httptest.NewRecorder()
+			body := makeTestEventBuffer("me")
+			bodyBuffer := bytes.NewBuffer(body)
+			r, _ := http.NewRequest("POST", "http://localhost/diagnostic", bodyBuffer)
+			r.Header.Set("Content-Type", "application/json")
+			r.Header.Set("Authorization", sdkKey)
+			relay.ServeHTTP(w, r)
+			result := w.Result()
+			if assert.Equal(t, http.StatusAccepted, result.StatusCode) {
+				event := requirePublishedEvent(body)
+				assert.Equal(t, "/diagnostic", event.url)
+				assert.Equal(t, sdkKey, event.authKey)
+			}
+		})
 	})
 
 	t.Run("mobile events proxies", func(t *testing.T) {
@@ -654,6 +686,22 @@ func TestRelay(t *testing.T) {
 				assert.Equal(t, mobileKey, event.authKey)
 			}
 		}
+
+		t.Run("diagnostics forwarding", func(t *testing.T) {
+			w := httptest.NewRecorder()
+			body := makeTestEventBuffer("me")
+			bodyBuffer := bytes.NewBuffer(body)
+			r, _ := http.NewRequest("POST", "http://localhost/mobile/events/diagnostic", bodyBuffer)
+			r.Header.Set("Content-Type", "application/json")
+			r.Header.Set("Authorization", mobileKey)
+			relay.ServeHTTP(w, r)
+			result := w.Result()
+			if assert.Equal(t, http.StatusAccepted, result.StatusCode) {
+				event := requirePublishedEvent(body)
+				assert.Equal(t, "/mobile/events/diagnostic", event.url)
+				assert.Equal(t, mobileKey, event.authKey)
+			}
+		})
 	})
 
 	t.Run("client-side events proxies", func(t *testing.T) {
@@ -683,6 +731,22 @@ func TestRelay(t *testing.T) {
 			relay.ServeHTTP(w, r)
 			result := w.Result()
 			if assert.Equal(t, http.StatusOK, result.StatusCode) {
+				event := requirePublishedEvent(body)
+				assert.Equal(t, expectedPath, event.url)
+				assert.Equal(t, "", event.authKey)
+			}
+		})
+
+		t.Run("diagnostics forwarding", func(t *testing.T) {
+			w := httptest.NewRecorder()
+			body := makeTestEventBuffer("me")
+			bodyBuffer := bytes.NewBuffer(body)
+			expectedPath := fmt.Sprintf("/events/bulk/%s", envId)
+			r, _ := http.NewRequest("POST", "http://localhost"+expectedPath, bodyBuffer)
+			r.Header.Set("Content-Type", "application/json")
+			relay.ServeHTTP(w, r)
+			result := w.Result()
+			if assert.Equal(t, http.StatusAccepted, result.StatusCode) {
 				event := requirePublishedEvent(body)
 				assert.Equal(t, expectedPath, event.url)
 				assert.Equal(t, "", event.authKey)
@@ -737,6 +801,7 @@ func TestRelay(t *testing.T) {
 			assert.Equal(t, "", w.Result().Header.Get("Expires")) // TTL isn't set for this environment
 			assertQueryWithSameEtagIsCached(t, r, w.Result())
 			assertQueryWithDifferentEtagIsNotCached(t, r, w.Result())
+			assertNonStreamingHeaders(t, w.Header())
 		})
 
 		t.Run("get flag - not found", func(t *testing.T) {
@@ -763,6 +828,7 @@ func TestRelay(t *testing.T) {
 			assert.Equal(t, "", w.Result().Header.Get("Expires")) // TTL isn't set for this environment
 			assertQueryWithSameEtagIsCached(t, r, w.Result())
 			assertQueryWithDifferentEtagIsNotCached(t, r, w.Result())
+			assertNonStreamingHeaders(t, w.Header())
 		})
 
 		t.Run("get segment", func(t *testing.T) {
@@ -773,6 +839,7 @@ func TestRelay(t *testing.T) {
 			assert.Equal(t, "", w.Result().Header.Get("Expires")) // TTL isn't set for this environment
 			assertQueryWithSameEtagIsCached(t, r, w.Result())
 			assertQueryWithDifferentEtagIsNotCached(t, r, w.Result())
+			assertNonStreamingHeaders(t, w.Header())
 		})
 
 		t.Run("get segment - not found", func(t *testing.T) {
